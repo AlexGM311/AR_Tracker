@@ -8,7 +8,9 @@ using OpenCVForUnity.ImgprocModule;
 using OpenCVForUnity.TrackingModule;
 using OpenCVForUnity.UnityUtils;
 using OpenCVForUnity.VideoModule;
+using Unity.WebRTC;
 using UnityEngine.Android;
+using UnityEngine.Experimental.Rendering;
 using UnityEngine.UI;
 using Rect = OpenCVForUnity.CoreModule.Rect;
 
@@ -16,7 +18,6 @@ public class CameraCapture : MonoBehaviour
 {
     public RawImage display;
 
-    WebCamTexture webCamTexture;
     Mat frameMat;
     Texture2D texture;
 
@@ -26,11 +27,23 @@ public class CameraCapture : MonoBehaviour
     private Rect2d trackingRect;
     private bool isTracking = false;
     private List<Tracker> trackers = new List<Tracker>();
-    private bool isDragging = false;
     private bool buttonDown = false;
     private bool buttonPressed = false;
     private List<Rect> bboxes = new List<Rect>();
-    
+    public static RenderTexture BBoxTexture;
+    public static Mat BboxMat;
+    private Texture2D testImage;
+    private RenderTexture videoBuffer;
+    private bool isTextureChanging = false;
+    private bool fixVst = false;
+
+    public void Awake()
+    {
+        testImage = Resources.Load<Texture2D>("7 1");
+        BBoxTexture = new RenderTexture(640, 360, 0, GraphicsFormat.B8G8R8A8_SRGB);
+        BBoxTexture.Create();
+    }
+
     public void OnSelectButtonClicked()
     {
         buttonDown = true;
@@ -40,93 +53,125 @@ public class CameraCapture : MonoBehaviour
         bboxes.Clear();
         Debug.Log("Начат процесс выбора");
     }
-
     
-    void Start()
+    IEnumerator HandleTextureResize()
     {
-    #if UNITY_ANDROID && !UNITY_EDITOR
-        if (!Permission.HasUserAuthorizedPermission(Permission.Camera)) {
-            Permission.RequestUserPermission(Permission.Camera);
-        }
-    #endif
-        
-        StartCoroutine(InitializeCamera());
-    }
+        isTextureChanging = true;
     
-    IEnumerator InitializeCamera() {
-        // Wait until permissions are granted (Android)
-        while (!Permission.HasUserAuthorizedPermission(Permission.Camera)) {
-            yield return null;
-        }
-
-        // Check if any camera is available
-        if (WebCamTexture.devices.Length == 0) {
-            Debug.LogError("No camera found!");
-            yield break;
-        }
-
-        WebCamDevice device = WebCamTexture.devices[0];
-
-        yield return InitializeCameraAtFraction(device, 2);
-    }
-
-    IEnumerator InitializeCameraAtFraction(WebCamDevice device, float fraction)
-    {
-        webCamTexture = new WebCamTexture(device.name, (int)(Screen.width / fraction), (int)(Screen.height / fraction), 60);
-        webCamTexture.Play();
-        yield return new WaitUntil(() => webCamTexture.width > 16);
-
-        // Только теперь создаём матрицу и текстуру
-        frameMat = new Mat(webCamTexture.height, webCamTexture.width, CvType.CV_8UC3);
-        texture = new Texture2D(webCamTexture.width, webCamTexture.height, TextureFormat.RGB24, false);
-        display.texture = texture;
-        AdjustAspectRatio();
-    } 
-
-    void AdjustAspectRatio()
-    {
-        float textureAspect = (float)webCamTexture.width / webCamTexture.height;
-        float screenAspect = (float)Screen.width / Screen.height;
-
-        RectTransform rt = display.rectTransform;
-
-        if (textureAspect > screenAspect)
+        // Dispose old resources
+        frameMat?.Dispose();
+        Destroy(texture);
+        Destroy(BBoxTexture);
+    
+        // Wait until end of frame to prevent GL errors
+        yield return new WaitForEndOfFrame();
+    
+        // Create new resources
+        try 
         {
-            // Камера шире — ограничиваем по ширине
-            float width = Screen.width;
-            float height = width / textureAspect;
-            rt.sizeDelta = new Vector2(width, height);
+            frameMat = new Mat(
+                WebRtcManager.RemoteTexture.height, 
+                WebRtcManager.RemoteTexture.width, 
+                CvType.CV_8UC4);
+            
+            texture = new Texture2D(
+                WebRtcManager.RemoteTexture.width, 
+                WebRtcManager.RemoteTexture.height, 
+                GraphicsFormat.B8G8R8A8_SRGB,
+                TextureCreationFlags.None);
+            
+            BBoxTexture = new RenderTexture(
+                640, 
+                360,
+                GraphicsFormat.B8G8R8A8_SRGB,
+                0);
+            fixVst = true;
         }
-        else
+        catch (Exception e)
         {
-            // Камера выше — ограничиваем по высоте
-            float height = Screen.height;
-            float width = height * textureAspect;
-            rt.sizeDelta = new Vector2(width, height);
+            Debug.LogError($"Resize failed: {e.Message}");
         }
+    
+        isTextureChanging = false;
     }
     
     void Update()
     {
-        if (!webCamTexture.isPlaying)
+        if (isTextureChanging) return;
+        if (!WebRtcManager.RemoteTexture)
+        {
+            // Debug.Log("Remote texture is null");
             return;
+        }
+        if (WebRtcManager.RemoteTexture.width <= 0 || 
+            WebRtcManager.RemoteTexture.height <= 0)
+        {
+            Debug.LogWarning("Invalid texture dimensions received");
+            return;
+        }
+        if (frameMat == null || !texture || texture.width != WebRtcManager.RemoteTexture.width 
+            || texture.height != WebRtcManager.RemoteTexture.height)
+        {
+            StartCoroutine(HandleTextureResize());
+            return;
+        }
+        if (fixVst)
+        {
+            WebRtcManager.FixTrack();
+            fixVst = false;
+        }
         
-        Utils.texture2DToMat(WebRTCReceiver.remoteTexture, frameMat);
-        Imgproc.cvtColor(frameMat, frameMat, Imgproc.COLOR_RGBA2RGB);
         
+        BboxMat = new Mat(new Size(640, 360), CvType.CV_8UC4, new Scalar(0, 0, 0, 0));
+        if (!BBoxTexture || BBoxTexture.width != BboxMat.width())
+        {
+            Destroy(BBoxTexture);
+            BBoxTexture = new RenderTexture(
+                BboxMat.width(), 
+                BboxMat.height(), 
+                0, 
+                GraphicsFormat.B8G8R8A8_SRGB
+            );
+        }
+        
+        Utils.textureToTexture2D(WebRtcManager.RemoteTexture, texture);
+        Utils.texture2DToMat(texture, frameMat);
+        
+        if (Input.GetKey(KeyCode.B))
+        {
+            if (BBoxTexture)
+            {
+                display.texture = BBoxTexture;
+                display.rectTransform.sizeDelta = new Vector2(
+                    BBoxTexture.width,
+                    BBoxTexture.height
+                );
+            }
+            else
+            {
+                Debug.LogWarning("BBoxTexture is null");
+            }
+        }
+        else
+        {
+            display.texture = texture;
+        }
+
+        if (!display.texture)
+            display.texture = texture;
         // ======== Трекинг ========
         if (isTracking)
         {
-            Debug.Log($"Tracking {trackers.Count} boxes");
             for (int i = 0; i < trackers.Count; i++)
             {
                 Rect updatedBox = new Rect();
                 bool ok = trackers[i].update(frameMat, updatedBox);
                 if (ok)
                 {
-                    Debug.Log("drawing");
+                    Debug.Log("Drawing boxes");
                     bboxes[i] = updatedBox;
-                    Imgproc.rectangle(frameMat, updatedBox.tl(), updatedBox.br(), new Scalar(255, 0, 0), 2);
+                    Imgproc.rectangle(frameMat, updatedBox.tl(), updatedBox.br(), new Scalar(255, 0, 0, 255), 2);
+                    Imgproc.rectangle(BboxMat, updatedBox.tl(), updatedBox.br(), new Scalar(255, 0, 0, 255), 2);
                 }
                 else
                 {
@@ -164,8 +209,8 @@ public class CameraCapture : MonoBehaviour
             float x = localPoint.x + rt.rect.width / 2f;
             float y = localPoint.y + rt.rect.height / 2f;
 
-            float scaleX = (float)webCamTexture.width / rt.rect.width;
-            float scaleY = (float)webCamTexture.height / rt.rect.height;
+            float scaleX = (float)WebRtcManager.RemoteTexture.width / rt.rect.width;
+            float scaleY = (float)WebRtcManager.RemoteTexture.height / rt.rect.height;
 
             float camX = x * scaleX;
             float camY = y * scaleY;
@@ -177,7 +222,7 @@ public class CameraCapture : MonoBehaviour
             mousePos = new Vector2(-1e9f, -1e9f); // вне RawImage — пропускаем кадр
         }
         if (buttonDown && !pressed) buttonDown = false;
-        else if (buttonDown || !buttonPressed) {Debug.Log("Quitting early");} // Если прошлый if не сработал, а кнопка нажата
+        else if (buttonDown || !buttonPressed) {/*Debug.Log("Quitting early");*/} // Если прошлый if не сработал, а кнопка нажата
         else if (!isSelecting && pressed)
         {
             Debug.Log($"Started selection from ({mousePos.x}, {mousePos.y})");
@@ -190,7 +235,8 @@ public class CameraCapture : MonoBehaviour
             endMousePos = mousePos;
             Point p1 = new Point(startMousePos.x, frameMat.height() - startMousePos.y);
             Point p2 = new Point(endMousePos.x, frameMat.height() - endMousePos.y);
-            Imgproc.rectangle(frameMat, p1, p2, new Scalar(0, 255, 0), 2);
+            Imgproc.rectangle(frameMat, p1, p2, new Scalar(0, 255, 0, 255), 2);
+            Imgproc.rectangle(BboxMat, p1, p2, new Scalar(0, 255, 0, 255), 2);
         }
         else if (!pressed && isSelecting)
         {
@@ -208,6 +254,7 @@ public class CameraCapture : MonoBehaviour
                 Point p1 = new Point(startMousePos.x, frameMat.height() - startMousePos.y);
                 Point p2 = new Point(endMousePos.x, frameMat.height() - endMousePos.y);
                 bboxes.Add(new Rect(p1, p2));
+                Debug.Log($"Added bb {p1} {p2}");
 
                 var tracker = TrackerCSRT.create();
                 tracker.init(frameMat, bboxes[^1]);
@@ -224,29 +271,25 @@ public class CameraCapture : MonoBehaviour
             StartTracking();
         }
         
-        Utils.fastMatToTexture2D(frameMat, texture);
-    }
-
+        Texture2D tempTex = new Texture2D(BboxMat.width(), BboxMat.height(), GraphicsFormat.B8G8R8A8_SRGB, TextureCreationFlags.None);
+        Utils.matToTexture2D(frameMat, texture);
+        Utils.matToTexture2D(BboxMat, tempTex);
+        Graphics.Blit(tempTex, BBoxTexture);
+        // Graphics.Blit(testImage, BBoxTexture);
+        BboxMat.Dispose();
+        Destroy(tempTex);
+    }   
 
     void StartTracking()
     {
         isTracking = true;
-        trackers.Clear();
+        trackers.Clear();               
 
         for (int i = 0; i < bboxes.Count; i++)
         {
             var tracker = TrackerCSRT.create();
             tracker.init(frameMat, bboxes[i]);
             trackers.Add(tracker);
-        }
-    }
-
-
-    void OnDestroy()
-    {
-        if (webCamTexture != null)
-        {
-            webCamTexture.Stop();
         }
     }
 }
