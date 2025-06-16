@@ -1,15 +1,11 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.Linq;
 using UnityEngine;
 using OpenCVForUnity.CoreModule;
 using OpenCVForUnity.ImgprocModule;
 using OpenCVForUnity.TrackingModule;
 using OpenCVForUnity.UnityUtils;
 using OpenCVForUnity.VideoModule;
-using Unity.WebRTC;
-using UnityEngine.Android;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.UI;
 using Rect = OpenCVForUnity.CoreModule.Rect;
@@ -25,79 +21,47 @@ public class CameraCapture : MonoBehaviour
     private Vector2 endMousePos;
     private bool isSelecting = false;
     private Rect2d trackingRect;
-    private bool isTracking = false;
     private List<Tracker> trackers = new List<Tracker>();
     private bool buttonDown = false;
     private bool buttonPressed = false;
     private List<Rect> bboxes = new List<Rect>();
-    public static RenderTexture BBoxTexture;
-    public static Mat BboxMat;
-    private Texture2D testImage;
-    private RenderTexture videoBuffer;
-    private bool isTextureChanging = false;
-    private bool fixVst = false;
+    public static RenderTexture SendTexture;
+    public static Size Dimensions = new (720, 402);
 
-    public void Awake()
+    public void Start()
     {
-        testImage = Resources.Load<Texture2D>("7 1");
-        BBoxTexture = new RenderTexture(640, 360, 0, GraphicsFormat.B8G8R8A8_SRGB);
-        BBoxTexture.Create();
+        Screen.SetResolution((int)Dimensions.width, (int)Dimensions.height, false);
+        // testImage = Resources.Load<Texture2D>("7 1");
+        SendTexture = new RenderTexture(640, 360, 0, GraphicsFormat.B8G8R8A8_SRGB);
+        texture = new Texture2D((int)Dimensions.width, (int)Dimensions.height, TextureFormat.RGB24, false);
+        frameMat = new Mat((int)Dimensions.height, (int)Dimensions.width    , CvType.CV_8UC3);
     }
 
     public void OnSelectButtonClicked()
     {
         buttonDown = true;
         buttonPressed = true;
-        isTracking = false;
+        foreach (var tracker in trackers)
+            tracker.Dispose();
         trackers.Clear();
         bboxes.Clear();
         Debug.Log("Начат процесс выбора");
     }
     
-    IEnumerator HandleTextureResize()
+    void ResizeTexture()
     {
-        isTextureChanging = true;
+        RenderTexture rt = RenderTexture.GetTemporary((int)Dimensions.width, (int)Dimensions.height);
+        RenderTexture.active = rt;
+        Graphics.Blit(WebRtcManager.RemoteTexture, rt);
+        texture.ReadPixels(new UnityEngine.Rect(0, 0, (int)Dimensions.width, (int)Dimensions.height), 0, 0);
+        texture.Apply();
     
-        // Dispose old resources
-        frameMat?.Dispose();
-        Destroy(texture);
-        Destroy(BBoxTexture);
-    
-        // Wait until end of frame to prevent GL errors
-        yield return new WaitForEndOfFrame();
-    
-        // Create new resources
-        try 
-        {
-            frameMat = new Mat(
-                WebRtcManager.RemoteTexture.height, 
-                WebRtcManager.RemoteTexture.width, 
-                CvType.CV_8UC4);
-            
-            texture = new Texture2D(
-                WebRtcManager.RemoteTexture.width, 
-                WebRtcManager.RemoteTexture.height, 
-                GraphicsFormat.B8G8R8A8_SRGB,
-                TextureCreationFlags.None);
-            
-            BBoxTexture = new RenderTexture(
-                640, 
-                360,
-                GraphicsFormat.B8G8R8A8_SRGB,
-                0);
-            fixVst = true;
-        }
-        catch (Exception e)
-        {
-            Debug.LogError($"Resize failed: {e.Message}");
-        }
-    
-        isTextureChanging = false;
+        RenderTexture.active = null;
+        RenderTexture.ReleaseTemporary(rt);
     }
     
     void Update()
     {
-        if (isTextureChanging) return;
         if (!WebRtcManager.RemoteTexture)
         {
             // Debug.Log("Remote texture is null");
@@ -109,58 +73,13 @@ public class CameraCapture : MonoBehaviour
             Debug.LogWarning("Invalid texture dimensions received");
             return;
         }
-        if (frameMat == null || !texture || texture.width != WebRtcManager.RemoteTexture.width 
-            || texture.height != WebRtcManager.RemoteTexture.height)
-        {
-            StartCoroutine(HandleTextureResize());
-            return;
-        }
-        if (fixVst)
-        {
-            WebRtcManager.FixTrack();
-            fixVst = false;
-        }
-        
-        
-        BboxMat = new Mat(new Size(640, 360), CvType.CV_8UC4, new Scalar(0, 0, 0, 0));
-        if (!BBoxTexture || BBoxTexture.width != BboxMat.width())
-        {
-            Destroy(BBoxTexture);
-            BBoxTexture = new RenderTexture(
-                BboxMat.width(), 
-                BboxMat.height(), 
-                0, 
-                GraphicsFormat.B8G8R8A8_SRGB
-            );
-        }
-        
-        Utils.textureToTexture2D(WebRtcManager.RemoteTexture, texture);
+        ResizeTexture();
         Utils.texture2DToMat(texture, frameMat);
         
-        if (Input.GetKey(KeyCode.B))
-        {
-            if (BBoxTexture)
-            {
-                display.texture = BBoxTexture;
-                display.rectTransform.sizeDelta = new Vector2(
-                    BBoxTexture.width,
-                    BBoxTexture.height
-                );
-            }
-            else
-            {
-                Debug.LogWarning("BBoxTexture is null");
-            }
-        }
-        else
-        {
-            display.texture = texture;
-        }
-
         if (!display.texture)
             display.texture = texture;
         // ======== Трекинг ========
-        if (isTracking)
+        if (bboxes.Count > 0)
         {
             for (int i = 0; i < trackers.Count; i++)
             {
@@ -168,10 +87,8 @@ public class CameraCapture : MonoBehaviour
                 bool ok = trackers[i].update(frameMat, updatedBox);
                 if (ok)
                 {
-                    Debug.Log("Drawing boxes");
                     bboxes[i] = updatedBox;
                     Imgproc.rectangle(frameMat, updatedBox.tl(), updatedBox.br(), new Scalar(255, 0, 0, 255), 2);
-                    Imgproc.rectangle(BboxMat, updatedBox.tl(), updatedBox.br(), new Scalar(255, 0, 0, 255), 2);
                 }
                 else
                 {
@@ -209,13 +126,13 @@ public class CameraCapture : MonoBehaviour
             float x = localPoint.x + rt.rect.width / 2f;
             float y = localPoint.y + rt.rect.height / 2f;
 
-            float scaleX = (float)WebRtcManager.RemoteTexture.width / rt.rect.width;
-            float scaleY = (float)WebRtcManager.RemoteTexture.height / rt.rect.height;
+            double scaleX = Dimensions.width / rt.rect.width;
+            double scaleY = Dimensions.height / rt.rect.height;
 
-            float camX = x * scaleX;
-            float camY = y * scaleY;
+            double camX = x * scaleX;
+            double camY = y * scaleY;
 
-            mousePos = new Vector2(camX, camY); // Теперь mousePos точно в пикселях frameMat
+            mousePos = new Vector2((float)camX, (float)camY);
         }
         else
         {
@@ -236,7 +153,6 @@ public class CameraCapture : MonoBehaviour
             Point p1 = new Point(startMousePos.x, frameMat.height() - startMousePos.y);
             Point p2 = new Point(endMousePos.x, frameMat.height() - endMousePos.y);
             Imgproc.rectangle(frameMat, p1, p2, new Scalar(0, 255, 0, 255), 2);
-            Imgproc.rectangle(BboxMat, p1, p2, new Scalar(0, 255, 0, 255), 2);
         }
         else if (!pressed && isSelecting)
         {
@@ -253,43 +169,32 @@ public class CameraCapture : MonoBehaviour
             {
                 Point p1 = new Point(startMousePos.x, frameMat.height() - startMousePos.y);
                 Point p2 = new Point(endMousePos.x, frameMat.height() - endMousePos.y);
-                bboxes.Add(new Rect(p1, p2));
-                Debug.Log($"Added bb {p1} {p2}");
+                
+                double x = Math.Min(p1.x, p2.x);
+                double y = Math.Min(p1.y, p2.y);
+                double width = Math.Abs(p2.x - p1.x);
+                double height = Math.Abs(p2.y - p1.y);
+                var rect = new Rect((int)x, (int)y, (int)width, (int)height);
+                
+                if (rect.x < 0 || rect.y < 0 || rect.x + rect.width > frameMat.cols() || rect.y + rect.height > frameMat.rows()) {
+                    Debug.LogError($"Bbox out of bounds: {rect}");
+                    return;
+                }if (frameMat.empty()) {
+                    Debug.LogError("Frame is empty!");
+                }
 
                 var tracker = TrackerCSRT.create();
-                tracker.init(frameMat, bboxes[^1]);
+                tracker.init(frameMat, rect);
                 trackers.Add(tracker);
+                bboxes.Add(rect);
             }
-        }
-        if (bboxes.Count > 0 && !isTracking)
-        {
-            Debug.Log($"{bboxes.Count} - bounding boxes count");
-            if (bboxes.Count > 1)
-            {
-                bboxes = new List<Rect>{bboxes.Last()};
-            }
-            StartTracking();
         }
         
-        Texture2D tempTex = new Texture2D(BboxMat.width(), BboxMat.height(), GraphicsFormat.B8G8R8A8_SRGB, TextureCreationFlags.None);
         Utils.matToTexture2D(frameMat, texture);
-        Utils.matToTexture2D(BboxMat, tempTex);
-        Graphics.Blit(tempTex, BBoxTexture);
-        // Graphics.Blit(testImage, BBoxTexture);
-        BboxMat.Dispose();
-        Destroy(tempTex);
-    }   
-
-    void StartTracking()
-    {
-        isTracking = true;
-        trackers.Clear();               
-
-        for (int i = 0; i < bboxes.Count; i++)
-        {
-            var tracker = TrackerCSRT.create();
-            tracker.init(frameMat, bboxes[i]);
-            trackers.Add(tracker);
-        }
+        RenderTexture temp = RenderTexture.active;
+        RenderTexture.active = SendTexture;
+        GL.Clear(true, true, Color.clear);
+        Graphics.Blit(texture, SendTexture);
+        RenderTexture.active = temp;
     }
 }

@@ -41,7 +41,7 @@ public class WebRtcManager : MonoBehaviour
         var uri = new Uri("https://dev.dinsp.ru");
         await GetToken();
         Debug.Log("Got token and pid");
-        vst = new VideoStreamTrack(CameraCapture.BBoxTexture);
+        vst = new VideoStreamTrack(CameraCapture.SendTexture);
         
         socket = new SocketIOUnity(uri, new SocketIOOptions
         {
@@ -269,7 +269,6 @@ public class WebRtcManager : MonoBehaviour
                     Debug.Log($"[Video] Resolution changed to {tex.width}x{tex.height}");
                     remoteTexture = tex;
                 };
-                Debug.Log($"track.Enabled = {track.Enabled}, ReadyState = {track.ReadyState}");
             }
             else
             {
@@ -300,7 +299,7 @@ public class WebRtcManager : MonoBehaviour
             pc.Close();
             pc = null;
         }
-
+        Destroy(remoteTexture);
         companionId = null;
     }
 
@@ -331,22 +330,11 @@ public class WebRtcManager : MonoBehaviour
     {
         await _instance.socket.EmitAsync("call_hangup", new {_instance.companionId});
         _instance.CloseWebRtc();
+        await _instance.socket.DisconnectAsync();
     }
     
     public void OnDestroy()
     {
         Hangup();
-    }
-
-    public static void FixTrack()
-    {
-        if (vst is { } unityTrack)
-        {
-            // For Unity WebRTC package
-            Debug.Log($"Is video track alive? {unityTrack.ReadyState == TrackState.Live}");
-        }
-        
-        vst = new VideoStreamTrack(CameraCapture.BBoxTexture);
-        _instance.pc?.AddTrack(vst);
     }
 }
